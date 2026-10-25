@@ -52,6 +52,7 @@ from music_assistant.constants import (
     CONF_AUTH_ALLOW_SELF_REGISTRATION,
     CONF_BIND_IP,
     CONF_BIND_PORT,
+    CONF_LAN_GUEST_ACCESS,
     CONF_VALUE_AUTO,
     DEFAULT_HOST,
     INGRESS_SERVER_PORT,
@@ -693,6 +694,12 @@ class WebserverController(CoreController):
                 type=ConfigEntryType.BOOLEAN,
                 default_value=True,
                 hidden=not any(provider.domain == "hass" for provider in self.mass.providers),
+                requires_reload=False,
+            ),
+            ConfigEntry(
+                key=CONF_LAN_GUEST_ACCESS,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
                 requires_reload=False,
             ),
             ConfigEntry(

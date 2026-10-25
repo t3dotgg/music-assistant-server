@@ -8,12 +8,15 @@ join URL that guests open on their own device.
 
 from __future__ import annotations
 
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from typing import TYPE_CHECKING
 
+import ifaddr
 from music_assistant_models.auth import UserRole
 from music_assistant_models.errors import InvalidDataError
 
 if TYPE_CHECKING:
+    from aiohttp import web
     from music_assistant_models.auth import User
 
     from music_assistant.mass import MusicAssistant
@@ -23,6 +26,63 @@ DEFAULT_JOIN_CODE_EXPIRY_HOURS = 8
 # Owner id prefixes, naming the kind of authorization a credential is bound to
 GUEST_OWNER_PREFIX = "guest-"
 USER_OWNER_PREFIX = "user-"
+
+# The guest account that signed-out visitors on the local network use (see lan_guest_access)
+LAN_GUEST_USERNAME = "lan_guest"
+LAN_GUEST_DISPLAY_NAME = "Guest"
+
+
+def _parse_ip(value: str) -> IPv4Address | IPv6Address | None:
+    """Parse an IP address, dropping any IPv6 zone and unwrapping IPv4-mapped addresses."""
+    try:
+        address = ip_address(value.split("%", 1)[0].strip())
+    except ValueError:
+        return None
+    if isinstance(address, IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def lan_client_address(request: web.Request) -> IPv4Address | IPv6Address | None:
+    """
+    Return the address of the client that made the request.
+
+    A reverse proxy on this host (such as one that serves the web UI on port 80) connects
+    from loopback, so its X-Forwarded-For names the client. The last entry is the one the
+    proxy added itself. The header is only trusted from loopback, where no one else can
+    set it.
+
+    :param request: The aiohttp request.
+    """
+    peername = request.transport.get_extra_info("peername") if request.transport else None
+    if not peername or not (address := _parse_ip(peername[0])):
+        return None
+    if address.is_loopback and (forwarded := request.headers.get("X-Forwarded-For")):
+        return _parse_ip(forwarded.rsplit(",", 1)[-1])
+    return address
+
+
+def is_on_local_network(address: IPv4Address | IPv6Address) -> bool:
+    """
+    Return True if the address is this host itself or on one of its directly attached networks.
+
+    The networks come from the host's own interfaces, so this also covers an ISP assigned
+    IPv6 prefix that is not in a private range. A VPN interface with a single host
+    address (such as Tailscale's /32 and /128) covers only this host, not its peers.
+
+    :param address: The client address.
+    """
+    if address.is_loopback:
+        return True
+    for adapter in ifaddr.get_adapters():
+        for adapter_ip in adapter.ips:
+            # ifaddr returns IPv6 addresses as (address, flowinfo, scope_id) tuples
+            ip_str = adapter_ip.ip[0] if isinstance(adapter_ip.ip, tuple) else adapter_ip.ip
+            if (own := _parse_ip(ip_str)) is None or own.version != address.version:
+                continue
+            if address in ip_network(f"{own}/{adapter_ip.network_prefix}", strict=False):
+                return True
+    return False
 
 
 async def get_or_create_guest_user(mass: MusicAssistant, username: str, display_name: str) -> User:

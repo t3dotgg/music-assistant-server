@@ -26,6 +26,7 @@ from music_assistant_models.errors import (
     AuthenticationRequired,
     InsufficientPermissions,
     InvalidCommand,
+    InvalidDataError,
     InvalidToken,
     MusicAssistantError,
 )
@@ -35,12 +36,23 @@ from music_assistant_models.media_items import MediaItem, Playlist
 from music_assistant_models.media_items.metadata import IMAGE_PROXY_ID_RESOLVER
 from music_assistant_models.translations import TRANSLATION_RESOLVER
 
-from music_assistant.constants import HOMEASSISTANT_SYSTEM_USER, VERBOSE_LOG_LEVEL
+from music_assistant.constants import (
+    CONF_LAN_GUEST_ACCESS,
+    HOMEASSISTANT_SYSTEM_USER,
+    VERBOSE_LOG_LEVEL,
+)
 from music_assistant.helpers.api import (
     APICommandHandler,
     parse_arguments,
     redact_json_secrets,
     redact_secrets,
+)
+from music_assistant.helpers.guest_access import (
+    LAN_GUEST_DISPLAY_NAME,
+    LAN_GUEST_USERNAME,
+    get_or_create_guest_user,
+    is_on_local_network,
+    lan_client_address,
 )
 from music_assistant.helpers.provider_access import access_allows, with_derived_provider_filter
 from music_assistant.helpers.throttle_retry import RequestPriority, set_request_priority
@@ -467,6 +479,9 @@ class WebsocketClientHandler:
         token = msg.args.get("token") if msg.args else None
         if not token:
             token = msg.args.get("access_token") if msg.args else None
+        if not token and msg.args and msg.args.get("lan_guest"):
+            await self._handle_lan_guest_auth(msg)
+            return
         if not token:
             await self._send_message(
                 ErrorResultMessage(
@@ -503,8 +518,61 @@ class WebsocketClientHandler:
 
         # Get token_id for tracking revocation events
         token_id = await self.webserver.auth.get_token_id_from_token(token)
+        await self._complete_auth(msg, user, token, token_id)
 
-        # Store authenticated user, token, and token_id
+    async def _handle_lan_guest_auth(self, msg: CommandMessage) -> None:
+        """
+        Sign a client in as the LAN guest, without a token.
+
+        Only when guest access on the local network is enabled and the client connects
+        directly (not over Remote Access or Ingress) from the local network.
+
+        :param msg: The auth command message, sent with the lan_guest arg.
+        """
+        address = lan_client_address(self.request)
+        if not (
+            self.webserver.config.get_value(CONF_LAN_GUEST_ACCESS)
+            and self.auth_transport == AuthTransport.DIRECT
+            and address is not None
+            and is_on_local_network(address)
+        ):
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    AuthenticationRequired.error_code,
+                    "Guest access is not available for this connection",
+                )
+            )
+            return
+        try:
+            user = await get_or_create_guest_user(
+                self.mass, LAN_GUEST_USERNAME, LAN_GUEST_DISPLAY_NAME
+            )
+        except InvalidDataError as err:
+            # the lan_guest account was disabled (or taken by a non-guest account)
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    AuthenticationRequired.error_code,
+                    str(err),
+                    translation_key=err.translation_key,
+                    translation_args=err.translation_args,
+                )
+            )
+            return
+        await self._complete_auth(msg, user, None, None)
+
+    async def _complete_auth(
+        self, msg: CommandMessage, user: User, token: str | None, token_id: str | None
+    ) -> None:
+        """
+        Finish a successful auth command: store the user, answer, and subscribe to events.
+
+        :param msg: The auth command message.
+        :param user: The authenticated user.
+        :param token: The access token, or None for the LAN guest.
+        :param token_id: The id of that token, for tracking revocation.
+        """
         self._authenticated_user = user
         self._current_token = token
         self._token_id = token_id

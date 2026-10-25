@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from ipaddress import ip_address
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.auth import UserRole
@@ -205,3 +206,54 @@ def test_credential_owner_user_id_resolves_both_prefixes() -> None:
     assert guest_access.credential_owner_user_id("guest-g1") == "g1"
     assert guest_access.credential_owner_user_id("user-u1") == "u1"
     assert guest_access.credential_owner_user_id("token-t1") is None
+
+
+def _request(peer: str, forwarded_for: str | None = None) -> MagicMock:
+    """Create a mock aiohttp request from the given peer address."""
+    request = MagicMock()
+    request.transport.get_extra_info.return_value = (peer, 50000)
+    request.headers = {"X-Forwarded-For": forwarded_for} if forwarded_for else {}
+    return request
+
+
+def test_lan_client_address_trusts_forwarded_for_from_loopback() -> None:
+    """A proxy on this host connects from loopback; the client is its last forwarded entry."""
+    request = _request("127.0.0.1", "10.9.9.9, 192.168.1.20")
+
+    assert guest_access.lan_client_address(request) == ip_address("192.168.1.20")
+
+
+def test_lan_client_address_ignores_forwarded_for_from_others() -> None:
+    """Only a loopback peer may name another client address."""
+    request = _request("203.0.113.7", "192.168.1.20")
+
+    assert guest_access.lan_client_address(request) == ip_address("203.0.113.7")
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("192.168.213.40", True),
+        ("2604:5500:c0fc:3e00:415:d47b:c4fb:b8bb", True),
+        ("fe80::1", True),
+        ("127.0.0.1", True),
+        ("100.114.241.7", False),
+        ("192.168.1.40", False),
+        ("2604:5500:aaaa::1", False),
+    ],
+)
+def test_is_on_local_network(address: str, expected: bool) -> None:
+    """Only addresses on a network of the host's own interfaces count as local."""
+    adapters = [
+        _adapter(("192.168.213.122", 24), (("2604:5500:c0fc:3e00::743d", 0, 0), 64)),
+        _adapter((("fe80::caff:bfff:fe0b:743d", 0, 2), 64)),
+        # a VPN address covers only this host, not the other peers on the VPN
+        _adapter(("100.96.27.115", 32)),
+    ]
+    with patch.object(guest_access.ifaddr, "get_adapters", return_value=adapters):
+        assert guest_access.is_on_local_network(ip_address(address)) is expected
+
+
+def _adapter(*ips: tuple[str | tuple[str, int, int], int]) -> MagicMock:
+    """Create a mock ifaddr adapter with the given (ip, network_prefix) pairs."""
+    return MagicMock(ips=[MagicMock(ip=ip, network_prefix=prefix) for ip, prefix in ips])

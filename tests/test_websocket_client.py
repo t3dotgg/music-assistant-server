@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.access import PlaylistAccess
@@ -635,3 +635,70 @@ async def test_a_playlist_created_or_removed_out_of_sight_is_not_announced(
 
     assert _sent_events(client, _playlist_event(private, event=event_type)) == []
     assert _sent_events(client, _playlist_event(private)) == []
+
+
+def _lan_guest_client(*, enabled: bool = True, remote: bool = False, local: bool = True) -> Any:
+    """
+    Create a websocket client handler that asks to sign in as the LAN guest.
+
+    :param enabled: Whether guest access on the local network is enabled.
+    :param remote: Whether the client connects over Remote Access.
+    :param local: Whether the client address is on the local network.
+    """
+    client: Any = WebsocketClientHandler.__new__(WebsocketClientHandler)
+    client._logger = MagicMock()
+    client.mass = MagicMock()
+    client.webserver = MagicMock()
+    client.webserver.config.get_value.return_value = enabled
+    client.webserver.remote_access.is_gateway_connection.return_value = remote
+    client._is_ingress_proxy = False
+    client._webrtc_session_id = None
+    client._peer_address = "192.168.1.20"
+    client.request = MagicMock()
+    client._authenticated_user = None
+    client._send_message = AsyncMock()
+    client._subscribe_to_events = MagicMock()
+    client._is_local = local
+    return client
+
+
+async def _lan_guest_auth(client: Any) -> User:
+    """Send a lan_guest auth command to the client and return the guest it would sign in as."""
+    guest = User(user_id="guest_1", username="lan_guest", role=UserRole.GUEST)
+    module = "music_assistant.controllers.webserver.websocket_client"
+    with (
+        patch(f"{module}.lan_client_address", return_value=MagicMock()),
+        patch(f"{module}.is_on_local_network", return_value=client._is_local),
+        patch(f"{module}.get_or_create_guest_user", AsyncMock(return_value=guest)),
+        patch(f"{module}.with_derived_provider_filter", side_effect=lambda _mass, user: user),
+    ):
+        await client._handle_auth_command(
+            CommandMessage(message_id="1", command="auth", args={"lan_guest": True})
+        )
+    return guest
+
+
+async def test_lan_guest_auth_signs_in_a_local_client() -> None:
+    """A local client signs in as the guest when LAN guest access is enabled."""
+    client = _lan_guest_client()
+
+    guest = await _lan_guest_auth(client)
+
+    assert client._authenticated_user is guest
+    assert client._current_token is None
+    assert _sent_result(client)["authenticated"] is True
+    client._subscribe_to_events.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"enabled": False}, {"remote": True}, {"local": False}], ids=str
+)
+async def test_lan_guest_auth_refuses(kwargs: dict[str, bool]) -> None:
+    """No guest when the option is off, over Remote Access, or from outside the LAN."""
+    client = _lan_guest_client(**kwargs)
+
+    await _lan_guest_auth(client)
+
+    assert client._authenticated_user is None
+    assert _sent_error_code(client) is not None
+    client._subscribe_to_events.assert_not_called()
