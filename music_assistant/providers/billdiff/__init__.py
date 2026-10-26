@@ -44,6 +44,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 from music_assistant_models.unique_list import UniqueList
+from yarl import URL
 
 from music_assistant.helpers.util import install_package
 from music_assistant.models.music_provider import MusicProvider
@@ -63,6 +64,8 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # yt-dlp changes often to keep up with YouTube, so it is installed at runtime, not pinned
 YT_DLP_PACKAGE = "yt-dlp[default]"
 DEFAULT_STREAM_URL_EXPIRATION = 600
+YOUTUBE_CHUNK_SIZE = 10 * 1024 * 1024
+YOUTUBE_URL_WAIT_SECONDS = 10
 
 
 async def setup(
@@ -166,16 +169,16 @@ class BilldiffProvider(MusicProvider):
                 break
         duration = int(info["duration"]) if info.get("duration") else None
         if entry["provider"] == "youtube":
-            # A YouTube URL only works from the IPv4 address that yt-dlp used. ffmpeg would
-            # connect over IPv6 when the CDN has an IPv6 address and get a 403, so we fetch
-            # the audio ourselves (get_audio_stream) and MA seeks by skipping decoded audio.
+            # ffmpeg gets a 403 from YouTube's CDN and the host has no IPv6 route to it, so we
+            # fetch the audio ourselves over IPv4 (get_audio_stream). MA seeks by skipping
+            # decoded audio.
             return StreamDetails(
                 provider=self.instance_id,
                 item_id=item_id,
                 # let ffmpeg work out the format (usually Opus in WebM)
                 audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 stream_type=StreamType.CUSTOM,
-                data={"url": url, "headers": info.get("http_headers") or {}},
+                data=url,
                 duration=duration,
                 can_seek=False,
                 allow_seek=True,
@@ -202,14 +205,30 @@ class BilldiffProvider(MusicProvider):
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes]:
         """Return the audio of a YouTube track, fetched over IPv4."""
-        async with self._ipv4_session.get(
-            streamdetails.data["url"],
-            headers=streamdetails.data["headers"],
-            timeout=aiohttp.ClientTimeout(sock_connect=15, sock_read=60),
-        ) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.content.iter_chunked(64 * 1024):
-                yield chunk
+        # the URL is signed, so it must be sent exactly as given; yt-dlp's
+        # http_headers are left out because YouTube answers them with a 403
+        url = URL(streamdetails.data, encoded=True)
+        timeout = aiohttp.ClientTimeout(sock_connect=15, sock_read=60)
+        # YouTube throttles or cuts long requests, so fetch in ranges, as yt-dlp does
+        start, total = 0, None
+        while total is None or start < total:
+            headers = {"Range": f"bytes={start}-{start + YOUTUBE_CHUNK_SIZE - 1}"}
+            # a new URL answers 403 for its first seconds, so wait until it is valid
+            for _ in range(YOUTUBE_URL_WAIT_SECONDS):
+                resp = await self._ipv4_session.get(url, headers=headers, timeout=timeout)
+                if resp.status != 403:
+                    break
+                resp.release()
+                await asyncio.sleep(1)
+            async with resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Range", "/0").rsplit("/", 1)[1])
+                fetched = start
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    start += len(chunk)
+                    yield chunk
+            if start == fetched:
+                break
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
