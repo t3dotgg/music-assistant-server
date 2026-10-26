@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import socket
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -79,6 +80,7 @@ class BilldiffProvider(MusicProvider):
     # track id -> (catalog entry, the playlist it is in)
     _entries: dict[str, tuple[dict[str, Any], dict[str, Any]]]
     _catalog_lock: asyncio.Lock
+    _ipv4_session: aiohttp.ClientSession
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to setup this provider."""
@@ -94,6 +96,9 @@ class BilldiffProvider(MusicProvider):
         self._playlists = {}
         self._entries = {}
         self._catalog_lock = asyncio.Lock()
+        self._ipv4_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(family=socket.AF_INET)
+        )
         logging.getLogger("yt_dlp").setLevel(self.logger.level + 10)
         # a failed install must not stop the server, so playback reports it instead
         try:
@@ -159,22 +164,57 @@ class BilldiffProvider(MusicProvider):
             if expire_ts := query.get(param, [None])[0]:
                 expiration = max(30, int(expire_ts) - int(time.time()) - 10)
                 break
+        duration = int(info["duration"]) if info.get("duration") else None
+        if entry["provider"] == "youtube":
+            # A YouTube URL only works from the IPv4 address that yt-dlp used. ffmpeg would
+            # connect over IPv6 when the CDN has an IPv6 address and get a 403, so we fetch
+            # the audio ourselves (get_audio_stream) and MA seeks by skipping decoded audio.
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=item_id,
+                # let ffmpeg work out the format (usually Opus in WebM)
+                audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                stream_type=StreamType.CUSTOM,
+                data={"url": url, "headers": info.get("http_headers") or {}},
+                duration=duration,
+                can_seek=False,
+                allow_seek=True,
+                expiration=expiration,
+                # YouTube throttles delivery to about playback speed
+                is_realtime=True,
+            )
         return StreamDetails(
             provider=self.instance_id,
             item_id=item_id,
-            # let ffmpeg work out the format, YouTube and SoundCloud use several
+            # let ffmpeg work out the format, SoundCloud uses several
             audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
             stream_type=StreamType.HLS
             if str(info.get("protocol", "")).startswith("m3u8")
             else StreamType.HTTP,
             path=url,
-            duration=int(info["duration"]) if info.get("duration") else None,
+            duration=duration,
             can_seek=True,
             allow_seek=True,
             expiration=expiration,
-            # YouTube throttles delivery to about playback speed
-            is_realtime=entry["provider"] == "youtube",
         )
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes]:
+        """Return the audio of a YouTube track, fetched over IPv4."""
+        async with self._ipv4_session.get(
+            streamdetails.data["url"],
+            headers=streamdetails.data["headers"],
+            timeout=aiohttp.ClientTimeout(sock_connect=15, sock_read=60),
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Handle unload/close of the provider."""
+        await self._ipv4_session.close()
+        await super().unload(is_removed)
 
     def _extract_audio(self, url: str) -> dict[str, Any]:
         """
