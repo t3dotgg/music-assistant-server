@@ -1,0 +1,13 @@
+{
+  "type": "music",
+  "domain": "billdiff",
+  "stage": "beta",
+  "name": "billdiff",
+  "description": "The billdifferen playlist archive, played from YouTube and SoundCloud.",
+  "codeowners": ["@t3dotgg"],
+  "requirements": [],
+  "documentation": "https://pilldiff.t3.gg",
+  "multi_instance": false,
+  "builtin": true,
+  "allow_disable": true
+}
