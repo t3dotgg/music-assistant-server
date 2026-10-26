@@ -192,6 +192,9 @@ class BilldiffProvider(MusicProvider):
             "no_warnings": True,
             "noplaylist": True,
             "format": "bestaudio/best",
+            # IPv4 only: a host that has IPv6 addresses but no IPv6 route makes yt-dlp hang
+            "source_address": "0.0.0.0",  # noqa: S104 - picks IPv4, binds no server
+            "socket_timeout": 15,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
