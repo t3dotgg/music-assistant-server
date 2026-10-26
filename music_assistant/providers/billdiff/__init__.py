@@ -30,6 +30,7 @@ from music_assistant_models.errors import (
     UnplayableMediaError,
 )
 from music_assistant_models.media_items import (
+    Artist,
     AudioFormat,
     BrowseFolder,
     ItemMapping,
@@ -131,6 +132,21 @@ class BilldiffProvider(MusicProvider):
         """Get full track details by id."""
         entry, playlist = await self._get_entry(prov_track_id)
         return self._parse_track(entry, playlist)
+
+    async def get_artist(self, prov_artist_id: str) -> Artist:
+        """Get artist details by id. The catalog has only artist names, so the id is the name."""
+        return Artist(
+            item_id=prov_artist_id,
+            provider=self.instance_id,
+            name=prov_artist_id,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=prov_artist_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
