@@ -4,16 +4,22 @@ billdiff music provider for Music Assistant.
 Plays the billdifferen playlist archive (https://billdifferen.blogspot.com). The playlists come
 from the pilldiff catalog (https://pilldiff.t3.gg), which mixes YouTube and SoundCloud tracks in
 the blog's order. yt-dlp finds each track's audio on the server, so nothing needs a login.
+
+A background fill downloads every catalog track once into the server's cache folder, so a play
+starts from disk. A track that is not cached yet streams from YouTube or SoundCloud.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
+import shutil
 import socket
 import time
 from collections.abc import AsyncGenerator, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -66,6 +72,10 @@ YT_DLP_PACKAGE = "yt-dlp[default]"
 DEFAULT_STREAM_URL_EXPIRATION = 600
 YOUTUBE_CHUNK_SIZE = 10 * 1024 * 1024
 YOUTUBE_URL_WAIT_SECONDS = 10
+# the fill waits between downloads, so YouTube and SoundCloud do not rate-limit the server
+CACHE_FILL_PAUSE_SECONDS = 5
+CACHE_MIN_FREE_BYTES = 20 * 1024**3
+CACHE_INDEX = "index.json"
 
 
 async def setup(
@@ -84,6 +94,14 @@ class BilldiffProvider(MusicProvider):
     _entries: dict[str, tuple[dict[str, Any], dict[str, Any]]]
     _catalog_lock: asyncio.Lock
     _ipv4_session: aiohttp.ClientSession
+    _cache_dir: Path
+    # track id -> {"file": name in _cache_dir, "duration": seconds or None}
+    _cached: dict[str, dict[str, Any]]
+    # tracks that failed to download since the server started; the next start retries them
+    _failed: set[str]
+    # the tracks of the playlist opened or played last, which the fill downloads first
+    _priority: list[str]
+    _fill_task: asyncio.Task[None]
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to setup this provider."""
@@ -108,6 +126,11 @@ class BilldiffProvider(MusicProvider):
             await install_package(YT_DLP_PACKAGE)
         except RuntimeError as err:
             self.logger.warning("Could not install yt-dlp: %s", err)
+        self._cache_dir = Path(self.mass.cache_path) / self.domain
+        self._cached = await asyncio.to_thread(self._read_cache_index)
+        self._failed = set()
+        self._priority = []
+        self._fill_task = self.mass.create_task(self._fill_cache())
 
     async def browse(self, path: str) -> Sequence[MediaItemType | BrowseFolder]:
         """Browse the playlists, newest first."""
@@ -130,6 +153,7 @@ class BilldiffProvider(MusicProvider):
         if not (playlist := self._playlists.get(prov_playlist_id)):
             msg = f"billdiff playlist {prov_playlist_id} not found"
             raise MediaNotFoundError(msg)
+        self._priority = [entry["id"] for entry in playlist["tracks"]]
         return [
             self._parse_track(entry, playlist)
             for entry in playlist["tracks"]
@@ -158,7 +182,22 @@ class BilldiffProvider(MusicProvider):
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
-        entry, _ = await self._get_entry(item_id)
+        entry, playlist = await self._get_entry(item_id)
+        if cached := self._cached.get(item_id):
+            path = self._cache_dir / cached["file"]
+            if await asyncio.to_thread(path.is_file):
+                return StreamDetails(
+                    provider=self.instance_id,
+                    item_id=item_id,
+                    audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                    stream_type=StreamType.LOCAL_FILE,
+                    path=str(path),
+                    duration=cached["duration"],
+                    can_seek=True,
+                    allow_seek=True,
+                )
+            del self._cached[item_id]
+        self._priority = [e["id"] for e in playlist["tracks"]]
         info = await asyncio.to_thread(self._extract_audio, entry["playbackUrl"])
         url: str = info["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
@@ -183,8 +222,6 @@ class BilldiffProvider(MusicProvider):
                 can_seek=False,
                 allow_seek=True,
                 expiration=expiration,
-                # YouTube throttles delivery to about playback speed
-                is_realtime=True,
             )
         return StreamDetails(
             provider=self.instance_id,
@@ -232,14 +269,84 @@ class BilldiffProvider(MusicProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        self._fill_task.cancel()
         await self._ipv4_session.close()
         await super().unload(is_removed)
 
-    def _extract_audio(self, url: str) -> dict[str, Any]:
+    async def _fill_cache(self) -> None:
+        """Download the catalog tracks that are not cached yet, one at a time, until all are."""
+        while True:
+            try:
+                await self._load_catalog()
+            except ProviderUnavailableError as err:
+                self.logger.warning("billdiff cache waits for the catalog: %s", err)
+                await asyncio.sleep(600)
+                continue
+            if not (track_id := self._next_uncached()):
+                # a catalog refresh can add tracks
+                await asyncio.sleep(CATALOG_MAX_AGE)
+                continue
+            usage = await asyncio.to_thread(shutil.disk_usage, self._cache_dir)
+            if usage.free < CACHE_MIN_FREE_BYTES:
+                self.logger.warning("billdiff cache stopped: less than 20 GB free on the disk")
+                return
+            entry, _ = self._entries[track_id]
+            try:
+                info = await asyncio.to_thread(
+                    self._extract_audio, entry["playbackUrl"], str(self._cache_dir / track_id)
+                )
+            except (UnplayableMediaError, OSError) as err:
+                self._failed.add(track_id)
+                self.logger.info("Could not cache billdiff track %s: %s", track_id, err)
+            else:
+                self._cached[track_id] = {
+                    "file": Path(info["filepath"]).name,
+                    "duration": int(info["duration"]) if info.get("duration") else None,
+                }
+                await asyncio.to_thread(self._write_cache_index, dict(self._cached))
+            await asyncio.sleep(CACHE_FILL_PAUSE_SECONDS)
+
+    def _next_uncached(self) -> str | None:
+        """Return the next track to cache: from the priority playlist first, then catalog order."""
+        for track_id in (*self._priority, *self._entries):
+            if (
+                track_id in self._entries
+                and track_id not in self._cached
+                and track_id not in self._failed
+            ):
+                return track_id
+        return None
+
+    def _read_cache_index(self) -> dict[str, dict[str, Any]]:
+        """Return the cached tracks whose files exist, and delete unfinished downloads."""
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            index: dict[str, dict[str, Any]] = json.loads(
+                (self._cache_dir / CACHE_INDEX).read_text()
+            )
+        except OSError, ValueError:
+            index = {}
+        files = {f.name for f in self._cache_dir.iterdir()}
+        # a finished file is "<track id>.<ext>"; yt-dlp's .part, .ytdl and fragment files and
+        # our own index.json.tmp have a second dot
+        for name in files:
+            if name.count(".") > 1:
+                (self._cache_dir / name).unlink()
+        return {track_id: c for track_id, c in index.items() if c["file"] in files}
+
+    def _write_cache_index(self, index: dict[str, dict[str, Any]]) -> None:
+        """Replace the cache index file in one step, so a crash never leaves half of it."""
+        tmp = self._cache_dir / f"{CACHE_INDEX}.tmp"
+        tmp.write_text(json.dumps(index))
+        tmp.replace(self._cache_dir / CACHE_INDEX)
+
+    def _extract_audio(self, url: str, download_to: str | None = None) -> dict[str, Any]:
         """
         Find the best audio stream for a YouTube or SoundCloud page with yt-dlp.
 
         :param url: The YouTube or SoundCloud URL from the catalog.
+        :param download_to: Also download the audio to this path, plus the file extension.
+            The result then has the file in "filepath".
         :raises UnplayableMediaError: yt-dlp is missing or can not play this URL.
         """
         try:
@@ -255,11 +362,16 @@ class BilldiffProvider(MusicProvider):
             "source_address": "0.0.0.0",  # noqa: S104 - picks IPv4, binds no server
             "socket_timeout": 15,
         }
+        if download_to:
+            # retries also ride out the 403 that a new YouTube URL answers at first
+            opts |= {"outtmpl": f"{download_to}.%(ext)s", "noprogress": True, "retries": 10}
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
-                info: dict[str, Any] = ydl.extract_info(url, download=False)
+                info: dict[str, Any] = ydl.extract_info(url, download=bool(download_to))
             except yt_dlp.utils.DownloadError as err:
                 raise UnplayableMediaError(str(err)) from err
+            if download_to:
+                info["filepath"] = ydl.prepare_filename(info)
         if not info.get("url"):
             msg = f"No audio stream found for {url}"
             raise UnplayableMediaError(msg)
