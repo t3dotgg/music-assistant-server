@@ -3,9 +3,10 @@
 import sqlite3
 from collections.abc import AsyncGenerator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigActionResult
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import (
@@ -333,3 +334,21 @@ async def test_get_item_builtin_playlist_instance_uses_playlist_controller() -> 
         provider_instance_id_or_domain="builtin_1",
         allow_update_metadata=True,
     )
+
+
+async def test_refresh_library_waits_for_its_sync(music: MusicController) -> None:
+    """music/refresh is open to library readers and returns once its sync tasks are done."""
+    assert MusicController.refresh_library.api_required_scope == Scope.LIBRARY_READ  # type: ignore[attr-defined]
+    task = MagicMock(id="sync_albums")
+    with (
+        patch.object(music, "start_sync", AsyncMock(return_value=[task])) as mock_sync,
+        patch.object(
+            MusicController, "active_sync_tasks", new_callable=PropertyMock
+        ) as mock_active,
+        patch("music_assistant.controllers.music.controller.asyncio.sleep", AsyncMock()),
+    ):
+        mock_active.side_effect = [[task], [task], []]
+        await music.refresh_library([MediaType.ALBUM])
+
+    mock_sync.assert_awaited_once_with([MediaType.ALBUM])
+    assert mock_active.call_count == 3

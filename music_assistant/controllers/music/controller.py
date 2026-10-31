@@ -598,6 +598,24 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                     )
         return tasks
 
+    @api_command("music/refresh", required_scope=Scope.LIBRARY_READ)
+    async def refresh_library(self, media_types: list[MediaType]) -> None:
+        """
+        Sync the given media types from every music source and return when the sync is done.
+
+        Unlike music/sync, anyone who can read the library may run it, so a guest can pull in
+        favorites added on the music service since the last scheduled sync. A sync only copies
+        those favorites into the library, so this grants nothing else.
+        Returns after 2 minutes if the sync is still running.
+
+        :param media_types: The media types to sync.
+        """
+        task_ids = {task.id for task in await self.start_sync(media_types)}
+        for _ in range(120):
+            if not any(task.id in task_ids for task in self.active_sync_tasks):
+                return
+            await asyncio.sleep(1)
+
     @property
     def active_sync_tasks(self) -> list[BackgroundTask]:
         """Return provider sync tasks that are currently pending or running."""
