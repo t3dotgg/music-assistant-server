@@ -90,12 +90,12 @@ async def test_library_tracks_skip_drm_and_log_count(
 ) -> None:
     """DRM protected tracks are not imported and the number skipped is logged."""
 
-    async def _liked_tracks(_user_id: str) -> AsyncGenerator[dict[str, Any]]:
-        yield _track_obj(1, "Danceteria", DRM_TRANSCODINGS)
-        yield _track_obj(2, "Lofi Beat", PLAIN_TRANSCODINGS)
-        yield _track_obj(3, "The Fate of Ophelia", DRM_TRANSCODINGS)
+    async def _likes(_path: str, **_kwargs: Any) -> AsyncGenerator[dict[str, Any]]:
+        yield {"track": _track_obj(1, "Danceteria", DRM_TRANSCODINGS)}
+        yield {"track": _track_obj(2, "Lofi Beat", PLAIN_TRANSCODINGS)}
+        yield {"track": _track_obj(3, "The Fate of Ophelia", DRM_TRANSCODINGS)}
 
-    provider._soundcloud.get_track_details_liked = _liked_tracks
+    provider._soundcloud._paginated_query = _likes
 
     with caplog.at_level(logging.INFO):
         tracks = [track async for track in provider.get_library_tracks()]
@@ -115,11 +115,11 @@ async def test_library_drm_tracks_are_not_reported_as_sync_failures(
     category rather than something that went wrong, and the count is logged in one go.
     """
 
-    async def _liked_tracks(_user_id: str) -> AsyncGenerator[dict[str, Any]]:
-        yield _track_obj(1, "Danceteria", DRM_TRANSCODINGS)
-        yield _track_obj(2, "Lofi Beat", PLAIN_TRANSCODINGS)
+    async def _likes(_path: str, **_kwargs: Any) -> AsyncGenerator[dict[str, Any]]:
+        yield {"track": _track_obj(1, "Danceteria", DRM_TRANSCODINGS)}
+        yield {"track": _track_obj(2, "Lofi Beat", PLAIN_TRANSCODINGS)}
 
-    provider._soundcloud.get_track_details_liked = _liked_tracks
+    provider._soundcloud._paginated_query = _likes
 
     tracks = [track async for track in provider.get_library_tracks()]
 

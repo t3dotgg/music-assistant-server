@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -12,6 +13,8 @@ from music_assistant_models.enums import (
     ImageType,
     MediaType,
     ProviderFeature,
+    SortDirection,
+    SortField,
     StreamType,
 )
 from music_assistant_models.errors import InvalidDataError, LoginFailed, MediaNotFoundError
@@ -75,7 +78,7 @@ class DrmProtectedTrackError(MediaNotFoundError):
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Sequence
 
     from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.media_items import BrowseFolder, ItemMapping, MediaItemType
@@ -171,6 +174,23 @@ class SoundcloudMusicProvider(RecommendationPayloadMixin, MusicProvider):
             )
         return result
 
+    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Browse this provider's items, with the liked tracks newest first.
+
+        :param path: The path to browse, (e.g. provider_id://tracks).
+        """
+        if path.split("://", 1)[1] == "tracks" and (
+            tracks := await self.mass.music.tracks.library_items(
+                provider=self.instance_id,
+                summary=False,
+                sort_field=SortField.TIMESTAMP_ADDED,
+                sort_direction=SortDirection.DESC,
+            )
+        ):
+            return tracks
+        return await super().browse(path)
+
     async def get_library_artists(self) -> AsyncGenerator[Artist]:
         """Retrieve all library artists from Soundcloud."""
         time_start = time.time()
@@ -217,9 +237,17 @@ class SoundcloudMusicProvider(RecommendationPayloadMixin, MusicProvider):
         """Retrieve library tracks from Soundcloud."""
         time_start = time.time()
         drm_protected = 0
-        async for track in self._soundcloud.get_track_details_liked(self._user_id):
+        # soundcloudpy's get_track_details_liked drops the like's created_at, which we keep
+        # as date_added so browse can list the likes newest first, like Soundcloud does
+        async for like in self._soundcloud._paginated_query(
+            f"/users/{self._user_id}/track_likes", params={"limit": "100"}
+        ):
+            track = like.get("track")
             try:
-                yield await self._parse_track(track)
+                parsed = await self._parse_track(track)
+                if created_at := like.get("created_at"):
+                    parsed.date_added = datetime.fromisoformat(created_at).replace(microsecond=0)
+                yield parsed
             except DrmProtectedTrackError:
                 # a permanent restriction on the track rather than a failure to read it, so
                 # it is counted and logged once below instead of reported as a sync failure

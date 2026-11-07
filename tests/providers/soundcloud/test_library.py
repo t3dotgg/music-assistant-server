@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
 from music_assistant_models.enums import MediaType
@@ -104,17 +105,18 @@ async def test_library_playlists_skip_failing_details(
 async def test_library_tracks_skip_unparsable(
     provider: SoundcloudMusicProvider, sync_run: SyncRunState
 ) -> None:
-    """A track that cannot be parsed is skipped without failing the sync."""
+    """A track that cannot be parsed is skipped without failing the sync, and likes keep their date."""
 
-    async def _liked_tracks(_user_id: str) -> AsyncGenerator[dict[str, Any]]:
-        yield {"id": 1}  # missing title/duration
-        yield _track_obj(2)
+    async def _likes(_path: str, **_kwargs: Any) -> AsyncGenerator[dict[str, Any]]:
+        yield {"track": {"id": 1}}  # missing title/duration
+        yield {"created_at": "2026-11-01T12:00:00Z", "track": _track_obj(2)}
 
-    provider._soundcloud.get_track_details_liked = _liked_tracks
+    provider._soundcloud._paginated_query = _likes
 
     tracks = [track async for track in provider.get_library_tracks()]
 
     assert [track.item_id for track in tracks] == ["2"]
+    assert tracks[0].date_added == datetime(2026, 11, 1, 12, tzinfo=UTC)
     assert sync_run.skipped_item_ids == {MediaType.TRACK: {"1"}}
     assert not sync_run.incomplete_media_types
 
